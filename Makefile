@@ -1,10 +1,11 @@
 PREFIX=/usr
 DESTDIR=
-SYSCONFDIR=/etc
 
+dummy:
 
 install:
-	mkdir -pv $(DESTDIR)$(SYSCONFDIR)/abmpkg
-	cp conf/* $(DESTDIR)$(SYSCONFDIR)/abmpkg
-	touch $(DESTDIR)$(SYSCONFDIR)/abmpkg/{available,external,internal}
-	cp abmpkg $(DESTDIR)$(PREFIX)/bin
+	mkdir -pv $(DESTDIR)/etc/abmpkg
+	cp conf/* $(DESTDIR)/etc/abmpkg
+	touch $(DESTDIR)/etc/abmpkg/{available,external,internal}		
+	mkdir -pv $(DESTDIR)$(PREFIX)/bin/
+	cp abmpkg $(DESTDIR)$(PREFIX)/bin/
