@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+
+confdir = "/etc/abmpkg/" 
+current_mirror = 0
+install_location = "/usr/abmpkg/"
+
+
+import argparse
+import subprocess
+import os
+
+def logerror(msg):
+    print("[\033[31m!!\033[0m] " + msg)
+
+def loginfo(msg):
+    print("[\033[36mII\033[0m] " + msg)
+
+def logwarning(msg):
+    print("[\033[33mWW\033[0m] " + msg)
+
+def checkdata(string, data):
+
+    for i,pkginfo in enumerate(data):
+        if pkginfo.split(" ")[0] == string:
+            return [True,i]
+    return [False, 0]
+
+def getconf(filename):
+        contents = []
+        try:
+            file = open(confdir+filename)
+            contents = file.readlines()
+            file.close()
+        except:
+            logerror("Failed to read file " + confdir + filename)
+            exit(1)
+        
+        for i,s in enumerate(contents):
+            contents[i] = s.strip('\n')
+        return contents
+
+
+
+
+external_pkgs =  getconf("external") # packages downloaded by the package manager from a mirror
+internal_pkgs =  getconf("internal") # package tarballs unpacked by the package manager manually
+available_pkgs = getconf("available") # packages available to be downloaded
+mirrors =        getconf("mirrors") # list of mirrors to download packages from. if a mirror fails, we will try every other mirror
+
+arg_parser = argparse.ArgumentParser()
+arg_parser.add_argument("-s", "--sync", help="syncs the internal available package list with the mirror", action="store_true")
+arg_parser.add_argument("-d", "--delete", help="deletes packages", action="store_true")
+arg_parser.add_argument("-u", "--update", help="updates the system", action="store_true")
+arg_parser.add_argument("-i", "--install", help="installs packages", action="store_true")
+arg_parser.add_argument("-U", "--unpack", help="unpacks a package tarball", action="store_true")
+arg_parser.add_argument("package", nargs="*", help="package to be installed")
+args = arg_parser.parse_args()
+
+def getpackagemirrorfilename(package):
+    ok, line = checkdata(package, available_pkgs)
+    return [ok, available_pkgs[line].split(" ")[2]]
+
+def getdirname(package):
+        return package.replace(".tar.xz","").replace(".tar.bz2", "").replace(".tar.gz", "").replace(".tar", "")
+
+def getfilefrommirror(mirror, file, parentdir):
+    loginfo("Downloading " + file + " from mirror " + mirror)
+    try:
+        return subprocess.run(["wget", "-P", parentdir, mirror+file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+    except OSError:
+        logerror("wget was not found. Are you sure you have it installed in your system?")
+        exit(255)
+
+def checkinstalled(pkg):
+    
+    if checkdata(pkg, external_pkgs)[0]:
+        return True
+    
+    return checkdata(pkg, internal_pkgs)[0]
+
+    
+def install(tarname, dirname):
+    
+    currentdir = os.getcwd()
+    
+    os.chdir("/tmp")
+    
+    loginfo("Unpacking " + tarname)
+
+    try:
+
+        if subprocess.run(["tar", "-xpf", tarname],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode != 0:
+            logerror("Failed to unpack " + tarname)
+            os.chdir(currentdir)
+            return ["","",False]
+    
+    except OSError:
+        
+        logerror("Was not able to even run tar. Are you sure you have tar in your system?")
+        os.chdir(currentdir)
+        exit(255)
+
+    os.chdir(dirname)
+    
+    name, ver = ["",""]
+
+    try:    
+        file = open("abmpkginfo")
+        name, ver = file.readlines()[0].strip("\n").split(" ")
+        file.close()
+    except:
+        logerror("Failure getting package information")
+        os.chdir(currentdir)
+        return ["","",False]
+    
+    dependencies = []
+
+    try: 
+        file = open("abmpkgdeps")
+        dependencies = file.readlines()
+        file.close()
+    except:
+        logerror("Failure getting dependency information")
+        os.chdir(currentdir)
+        return [name, ver, False]
+
+    for i,s in enumerate(dependencies):
+
+        dependencies[i] = s.strip('\n')
+    
+    
+    missingdeps = []
+
+    if len(dependencies) > 0:
+        
+        for dependency in dependencies:
+                if checkinstalled(dependency):
+                    continue
+                missingdeps.append(dependency)
+        
+        if args.unpack and len(missingdeps) > 0: 
+            
+            logerror("Package has missing dependencies.")
+            logerror("Dependencies will not be installed by abmpkg if the user is unpacking a package tarball.")
+            logerror("You can override this and install without dependencies by emptying the abmpkgdeps file in the tarball archive and repacking it but doing so is not recommended")
+            logerror("Please install the dependencies manually:")
+            
+            for dependency in missingdeps:
+                logerror(dependency)
+
+            os.chdir(currentdir)
+            return [name, ver, False]
+
+    
+    for dependency in missingdeps:
+
+        loginfo("Downloading missing dependency " + dependency)
+
+        os.chdir("/tmp")
+        
+        ok, deptarballname = getpackagemirrorfilename(dependency) 
+        
+
+        if ok == False:
+            logerror("Failed to get package tarball name from list of available packages")
+            return [name, ver, False]
+        
+
+        depdirname = getdirname(deptarballname)
+        
+        depsuccess = False
+
+        for mirror in mirrors:
+            if getfilefrommirror(mirror, deptarballname, "/tmp") == 0:
+                depsuccess = True
+                break
+            
+            logwarning("Failed to download from mirror " + mirror)
+            
+                
+        if depsuccess == False:
+
+            logerror("Failed to download dependency " + dependency)
+            return [name, ver, False]
+            
+        depname, depver, depsuccess = install("/tmp/" + deptarballname.split("/")[-1], depdirname.split("/")[-1])
+        
+        if depsuccess == False:
+            logerror("Failed to install dependency " + dependency)
+            return [name, ver, False]
+
+        loginfo("Adding to list of external packages")
+
+        line = checkdata(depname,available_pkgs)[1]
+
+        verid = available_pkgs[line].split(" ")[3]
+
+        external_pkgs.append(depname + " " + depver + " " + verid)
+
+    
+    os.chdir("/tmp/" + dirname) 
+
+    loginfo("Running install script for " + name + " " + ver)
+
+    try:
+
+        if subprocess.run(["./install", install_location + name + "/" + ver + "/"],stdout=subprocess.DEVNULL).returncode != 0:
+            logerror("Install script returned an error.")
+            os.chdir(currentdir)
+            return [name,ver,False]
+    except OSError:
+
+        logerror("Install script not found")
+        os.chdir(currentdir)
+        return [name,ver,False]
+
+    
+    os.chdir(currentdir)
+    return [name,ver,True]
+
+
+def saveconf(conf,confname):
+    try:
+        file = open(confdir+confname, "w")
+        
+        for i,s in enumerate(conf):
+            conf[i] = s + "\n"
+        file.writelines(conf)
+        file.close() 
+    except:
+        logerror("Failed to write to file " + confdir + confname)
+        return False
+
+    return True
+    
+def mirrorstatus(mirror):
+    try:
+        return subprocess.run(["ping", "-c", "1", mirror],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode 
+    except OSError:
+        logwarning("ping command not found. Running blind")
+        return 0
+
+if os.geteuid() != 0:
+    logerror("Insuficient permissions. Please rerun as root.")
+    exit(254)
+
+
+# we don't need a network for these operations
+
+
+if args.unpack == True:
+    loginfo("Unpacking packages")
+
+    for package in args.package:
+        
+        dirname = getdirname(package)
+
+        name, ver, success = install(os.getcwd() + "/" + package, dirname)
+ 
+        if success == False:
+            logerror("Failed to install " + package)
+            continue
+        
+        loginfo("Adding to list of internal packages")
+        
+        internal_pkgs.append(name + " " + ver)
+
+        loginfo("Installed " + name + " " + ver)
+        
+
+    loginfo("Writing internal package list to disk")
+    saveconf(internal_pkgs, "internal")
+
+    exit(0)
+
+
+
+if args.delete == True:
+    loginfo("Removing packages")
+    
+    for package in args.package:
+
+        
+        ok, line = checkdata(package,external_pkgs)
+        external = True
+
+        if not ok:
+            
+            ok, line = checkdata(package,internal_pkgs)
+            external = False
+            if not ok:
+                logerror("Failed to find package " + package + " in the list of packages")
+                continue
+        
+        
+        data = ""
+
+        if external:
+            data = external_pkgs[line]
+        else:
+            data = internal_pkgs[line]
+        
+        data = data.split(" ")
+
+        scriptfolder = install_location + data[0] + "/" + data[1] + "/"
+
+        loginfo("Running uninstall script for " + package)
+        
+        currentdir = os.getcwd()
+
+        os.chdir(scriptfolder)
+        
+        
+        try:
+            if subprocess.run(["./uninstall"],stdout=subprocess.DEVNULL).returncode != 0:
+                logerror("Uninstall script returned an error.")
+                os.chdir(currentdir)
+        except OSError:
+            logerror("Uninstall script not found")
+            os.chdir(currentdir)
+            continue
+        
+        os.chdir(currentdir)
+
+        loginfo("Removing from package list")
+        
+        if external:
+            del external_pkgs[line]   
+        else:
+            del internal_pkgs[line]
+
+        loginfo("Uninstalled " + package)
+    
+    loginfo("Writing package lists to disk")
+    
+    saveconf(internal_pkgs,"internal")
+    saveconf(external_pkgs,"external")
+    
+    exit(0)
+
+# find the first online mirror
+
+first_working_mirror = 0
+
+for i,mirror in enumerate(mirrors):
+    if mirrorstatus(mirror) == 0:
+        break
+
+
+    first_working_mirror += 1
+
+
+
+if first_working_mirror != 0:
+    del mirrors[:first_working_mirror]
+    logwarning(str(first_working_mirror) + " mirrors not working!")
+        
+    if len(mirrors) == 0:
+        logerror("No working mirror!")
+        exit(3)
+
+
+current_mirror = first_working_mirror
+
+
+if args.sync == True:
+    loginfo("Syncing with mirror")
+    
+    success = False 
+    
+    subprocess.run(["mv", confdir + "/available", confdir + "/available.bak"])
+
+    for mirror in mirrors:
+        if getfilefrommirror(mirror, "/abmpkg/available", confdir) == 0:
+            loginfo("Synced!")
+            success = True
+            break 
+        current_mirror += 1
+    
+    if current_mirror > first_working_mirror:
+        logwarning("Unable to sync from " + str(current_mirror) + " mirrors!")
+        current_mirror = first_working_mirror
+
+    if success == False:
+        logerror("Could not sync with mirrors!")  
+        subprocess.run(["mv", confdir + "/available.bak", confdir + "/available"])
+        exit(2)
+
+if args.update == True:
+    loginfo("Updating system")
+
+    for package in external_pkgs:
+        
+        package, ver, oldverid = package.split(" ")
+
+        ok, line = checkdata(package, available_pkgs)
+        
+        if not ok:
+            logerror("Could not find " + package + " in the list of available mirror packages")
+            continue
+
+        availableline = available_pkgs[line].split(" ")
+        
+        if int(availableline[3]) <= int(oldverid):
+            continue
+
+        loginfo("New version available for " + package)
+
+        successful = False
+
+        for mirror in mirrors:
+
+            if getfilefrommirror(mirror, availableline[2], "/tmp") == 0:
+                successful = True
+                break            
+            logwarning("Failed to use mirror " + mirror)
+        
+
+        if not successful:
+            logerror("No mirrors working or which have the package " + package)
+            continue
+
+        tarballname = availableline[2].split("/")[-1]
+        
+
+        name, ver, successful = install("/tmp/" + tarballname, getdirname(tarballname))
+        
+
+
+        loginfo("Adding to list of external packages")
+        
+        line = checkdata(package, external_pkgs)[1]
+        
+        external_pkgs[line] = name + " " + ver + " " + availableline[3]
+    
+    loginfo("Saving external package list to disk")
+
+    saveconf(external_pkgs, "external")
+
+    exit(0)
+
+if args.install == True:
+    
+    loginfo("Installing packages")
+    
+    for package in args.package:
+        available,availableline = checkdata(package, available_pkgs)
+        alreadyinstalled,externalline = checkdata(package, external_pkgs)
+       
+        if not available:    
+            logerror("Package " + package + " not available")
+            continue
+
+        if alreadyinstalled:
+            
+            if int(available_pkgs[availableline].split(" ")[3]) > int(external_pkgs[externalline].split(" ")[2]):
+                loginfo("Updating package")
+
+            else:
+
+                logwarning("Package is already installed and no updates are available. Do you wish to reinstall it?")
+
+                choice = ""
+
+                while not (choice == 'y' or choice == 'n'):
+                    choice = input("[y/n]: ")
+                
+
+                if choice == 'n':
+                    continue
+
+        
+        downloadsucessful = False
+
+        for mirror in mirrors:
+
+            if getfilefrommirror(mirror, available_pkgs[availableline].split(" ")[2], "/tmp") == 0:
+                downloadsuccessful = True
+                break
+            
+            logwarning("Failed to use mirror " + mirror)
+       
+        if downloadsuccessful == False:
+            logerror("No mirror works or has this package.")
+            continue
+        
+        tarballname = available_pkgs[availableline].split(" ")[2].split("/")[-1]
+
+        name, ver, successful = install("/tmp/" + tarballname, getdirname(tarballname))
+        
+        if not successful:
+            logerror("Failed to install " + package)
+            continue
+
+        loginfo("Adding to list of external packages")
+        
+        external_pkgs.append(name + " " + ver + " " + available_pkgs[availableline].split(" ")[3])
+    
+    loginfo("Saving external package list to disk")
+
+    saveconf(external_pkgs, "external")
+
+    exit(0)
